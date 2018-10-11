@@ -99,7 +99,7 @@
 
 ;;Yields a set of <= 17 experiments that explore the factor space.
 ;;Experiments are merely [[factor1 x] [factor2 y] [factor3 z] ...] pairs.
-(defn facotrs->design [factors]
+(defn factors->design [factors]
   (let [flevel (factor-levels factors)]
     (cond (> flevel 17) (nolh-17 factors)
           (<= flevel 17) (full-factorial factors)
