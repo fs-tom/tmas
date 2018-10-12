@@ -149,19 +149,18 @@
     {:design-table ds
      :supply-records (design-table->supply-table ds)}))
 
+;;TODO: ensure paths use io/file-path...
 ;;This is the main driver for generating experimental designs and
 ;;supply records.
 ;;It can be invoked via:
 ;;(spit-designs
 ;;  "path/to/blah/input.txt"
 ;;  "path/to/outputdir")
-
 (defn spit-designs [inpath outroot]
   (let [{:keys [design-table supply-records]} (raw->designs inpath)
-        design-path (str outroot "\\designs.txt")]
+        design-path (str outroot "\\designs.txt")
+        supply-path (str outroot "\\supplies.txt")]
     (do (println [:saving-designs design-path])
-        (spit design-path
-              (tbl/table->tabdelimited design-table))
-        (println [:saving-supplyrecords (str outroot "\\supplies.txt")])
-        (spit (str outroot "\\supplies.txt")
-              (tbl/table->tabdelimited supply-records)))))
+        (spit design-path (tbl/table->tabdelimited design-table))
+        (println [:saving-supplyrecords supply-path ])
+        (spit supply-path (tbl/table->tabdelimited supply-records)))))
