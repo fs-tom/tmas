@@ -1,162 +1,167 @@
-;;This is a simple script to process outpu from multiple experimental
-;;runs.  Assuming we have a bunch of .txt files, we can scrape
-;;;them quite handily this way.  Each .txt file is currently assumed to
-;;be the deployments output from a marathon run.  We should be able to
-;;extend this into more domains though.
+;;A namespace for pre-processing the bulk design of
+;;experiment runs we're doing for tmas.
 (ns tmas.preproc
-  (:require
-   [spork.util
-    [table :as tbl]
-    [io :as io]]
-   [clojure.core.reducers :as r]
-   [tmas.util :as util]))
+  (:require [spork.util [table :as tbl]]
+            [tmas.doe :as doe]))
 
-(defn lines [path] (line-seq (clojure.java.io/reader path)))
-(defn find-files [root]
-  (filter #(re-find #"Experiment" (io/fname %) (io/list-files root))))
+;;We need the capability to perform a couple of processing steps here.
 
-(defn find-numerical-files
-  ([root filename]
-   (let [pat (re-pattern filename)]
-     (filter #(re-find pat (io/fname %))
-             (file-seq (clojure.java.io/file root)))))
-  ([root] (find-numerical-files root "Deployments")))
+;;first: define hundres of individual experimental designs
+;;experimen designs are relative to each src in a given dataset.
+;;the designs are determined by the following rule:
+;;  Given the factors (components), and their deltas,
+;;  if the factorial design is <= 17, then we compute a
+;;  full factorial analysis.
 
-(defn named-numerical-files [paths]
-  (reduce (fn [acc fl]
-            (assoc acc (io/fname (.getParent fl)) fl)) {} paths))
+;;  If our design levels exceed 17, we use the NOLH appraoch via the
+;;  DOE lib provided by NPS, using 17-level NOLH design.
 
-;;We add the filename to the file.
-(defn pathed-lines
-  ([path] (map (fn [l] (str path "\t" l)) (lines path)))
-  ([name path] (map (fn [l] (str name "\t" l)) (lines path))))
+(defn hilo-table [t]
+  (tbl/rename-fields {:s :src :floor :low :Q :high} t))
 
-;;some of the output from marathon is janky, missing the oititle.
-;;So we instead insert a tab at th end, iff the number of entries
-;;is off by one.
-(defn pad-amount [xs]
-  (let [headers (count (clojure.string/split (first xs) #"\t"))
-        entries (count (clojure.string/split (second xs) #"\t"))]
-    (- headers entries)))
+(defn clean-factors [bnd]
+  (let [low   (get bnd :low)
+        high  (get bnd :high)
+        compo (get bnd :compo)]
+    (if (>= high low)
+      [compo low high]
+      [compo low low])))
 
-;;This is a little hack to help us out...
-(defn padded-lines [name path]
-  (case (pad-amount (lines path))
-    0 (pathed-lines name path)
-    1 (map #(str % "\"\"\t") (pathed-lines name path))
-    (throw (Exception.
-            "More than one difference between entries and headers..."))))
+(defn table->supply-bounds [t]
+  (into {}
+        (for [[src xs] (group-by :src (tbl/table-records t))]
+          [src mapv clean-factors xs])))
 
-;;Concatenate the files we're expecting..
-(defn cat-files
-  ([root paths]
-   (let [names (if (map? path) (keys paths) paths)
-         paths (if (map? paths) (vals paths) paths)
-         named-paths (map vector names paths)
-         headers (str "SourceFile\t" (first (lines (first paths))))]
-     (reduce (fn [acc [name path]]
-               (concat acc (rest (padded-lines name path))))
-             (cons headers (rest (padded-lines (first names) (first paths))))
-             (rest named-paths))))
-  ([root] (cat-files root (find-numerical-files root))))
+;;Given a
+;;[name [[factor1 lo hi] [factor2 lo hi] .... [factorN lo hi]]]
+;;computes a design of <= 17 experiments, returning [name experiments]
+(defn bound->design [b] [(first b) (doe/factors->design (second b))])
 
-;;Concatenates our files into a single experiments.txt . If no files
-;;are specified, defaults to looking for filesakin to the tmas
-;;project structure.
-(defn collect-experiments
-  ([root paths]
-   (do (util/spit-lines (str root "\\experiments.txt")
-                        (cat-files root paths))))
-  ([root] (collect-experiments root
-              (named-numerical-files (find-numerical-files root)))))
+;;testing
+;;(def designs (map bound->design bounds))
 
-;;A simple schema for our table; this lets us parse much faster and
-;;provides the correct types for spork.util.table
-(def experiment-schema
-  {:SourceFile :text
-   :DeploymentID :long
-   :Location :text
-   :Demand :text
-   :DwellBeforeDeploy :long
-   :BogBudget :long
-   :CycleTime :long
-   :DeployInterval :long
-   :DeployDate :text
-   :FillType :text
-   :FillCount :long
-   :UnitType :text
-   :DemandType :text
-   :DemandGroup :text
-   :Unit :text
-   :Policy :text
-   :AtomicPolicy :text
-   :Component :text
-   :Period :text
-   :FillPath :text
-   :PathLength :long
-   :FollowOn :boolean
-   :FollowOnCount :long
-   :DeploymentCount :long
-   :Category :text
-   :OITitle :text
-   :DwellYearsBeforeDeploy :float})
+;;produces annotated records of the quantities of each
+;;src, compo quantity for each experiment.  Annotates an experiment
+;;number as well, o.  results in a batch of records, associated
+;;by experiment index.  Each value assocd to :qty is actually a map
+;;of factor->value.
+(defn designs->batches [ds]
+  (apply concat
+         (for [[src designs] ds]
+           (let [fenced? (if (= (count designs) 1) true false)]
+             (map-indexed (fn [idx d]
+                            {:s src :o idx :qty d :fenced fenced?})
+                          designs)))))
 
-;;Computes a table of average dwell before deployment by a compound
-;;key.  This is the primary input into the TMAS optimization.
-(defn process-experiments [tbl]
-  (let [_ (println :processing-experiments)]
-    (->> tbl
-         (r/map (fn [r]
-                  [((juxt :SourceFile :UnitType :ComponentType :Period) r)
-                   (:DwellBeforeDeploy r)]))
-         (reduce (fn [avgs [k dwell]]
-                   (if-let [res (get avgs k)]
-                     (let [[sum count] res]
-                       (assoc! avgs k [(+ sum dwell) (inc count)]))
-                     (assoc! avgs k [dwell 1])))
-                 (transient {}))
-         (persistent!)
-         (map (fn [[k v]]
-                (let [[fl src compo period] k
-                      [sum count] v]
-                  {:experiment fl
-                   :src src
-                   :compo compo
-                   :period period
-                   :sum sum
-                   :count count
-                   :avg (float (/ sum count))}))
-              (tbl/records->table)))))
+;;Effectively flattens the batches, making them easy to parse into a
+;;flat table of records.  Each factor is expanded under the :compo
+;;field, with its associated value.
+(defn batches->records [bs]
+  (mapcat (fn [r]
+            (let [rnew (dissoc r :qty)]
+              (reduce-kv (fn [acc compo qty]
+                           (conj acc
+                                 (-> rnew
+                                     (assoc :compo compo)
+                                     (assoc :q qty))))
+                         [] (:qty r)))) bs))
 
+(defn bound-table->design-table [t]
+  (->> t
+       (table->supply-bounds)
+       (map bound->design)
+       (designs->batches)
+       (batches->records)
+       (tbl/records->table)
+       (tbl/select-fields [:s :compo :o :q :fenced])))
 
-;;Reads a tabdelimited text file and parses it  as an experiments
-;;table, then proecsses it into a TMAS performance file.
-(defn process-experiments-file [path]
-  (process-experiments
-   (tbl/tabdelimited->table (slurp path)
-                            :schema experiment-schema)))
+;;TODO: Check the spec/migrate to marathon-schemas...
+;;__MARATHON IO functions__
+;;producing marathon supply experiment batches from our designs
+;;an empy supply record lookslike this...
+(def supply-template
+  {:Type       "SupplyRecord"
+   :Enabled    "True"
+   :Quantity   ""
+   :SRC        ""
+   :Component  ""
+   :OITitle    ""
+   :Name       "Auto"
+   :Behavior   "Auto"
+   :CycleTime  0
+   :Policy     "Auto"
+   :Tags       "Auto"
+   :SpawnTime  0
+   :Location   "Auto"
+   :Position   "Auto"
+   :Original   "True"
+   })
 
-;;High level call or entry-point for our processer.
-;;May be invoked simply by
-;;(spit-experiments "C:\\path\\to\\folder\\")
-;;This effectively scrapes all the runs in the root folder, produces
-;;an experiments.txt in the same folder, and produces a results.txt in
-;;the root folder.
+;;Use the experimental quantity to produce a supply record.
+(defn record->supply-record [r]
+  (merge supply-template
+         {:Component (:compo r)
+          :Quantity  (:q r)
+          :SRC       (:s r)
+          :fenced    (:fenced r)}))
 
-(defn spit-experiments
-  ([rootpath outpath]
-   (if-let [expath (do (println [:concating-files rootpath])
-                       (collect-experiments rootpath))]
-     (->> expath
-          (process-experiments-file)
-          (tbl/rename-fields {:experiment :o
-                              :src :s
-                              :compo :compo
-                              :period :period
-                              :avg :DBOG})
-          (tbl/select-fields [:s :compo :o :period :DBOG])
-          (tbl/table->tabdelimited)
-          (spit outpath))
-     (throw (Exception. (str "Could not collect experiments at " rootpath)))))
-  ([rootpath]
-   (spit-experiments rootpath (io/relative-path rootpath ["results.txt"])))
+;;We'll just produce a bigass table of supply-records.
+;;We'll add the field "batch" to indicate the collection of
+;;records forming a batch.  This should allow the folks to
+;;break up the runs into batches and monkey-jam it pretty
+;;easily by hand, even without modifications to marathon.
+;;Alternately, we could split the batch table into multiple
+;;batch files.
+(defn design-table->supply-table [t]
+  (->> (tbl/table-records t)
+       (map (fn [r]
+              (assoc (record->supply-record r) :o (:o r))))
+       (tbl/records->table)
+       (tbl/order-by [[:o :ascending]])
+       (tbl/select-fields
+        [:Type
+         :Enabled
+         :Quantity
+         :SRC
+         :Component
+         :OITitle
+         :Name
+         :Behavior
+         :CycleTime
+         :Policy
+         :Tags
+         :SpawnTime
+         :Location
+         :Position
+         :Original
+         :o
+         :fenced])))
+
+;;computes the design-table and the supply records (for reference)
+;;from a file located at path.  THe file should be  consistent with the
+;;TMAS input file, namely an [src compo floor q] schema.
+(defn raw->designs [path]
+  (let [ds (->> (tbl/tabdelimited->table (slurp path)
+                  :schema {"src" :text "compo" :text
+                           "floor" :int "Q" :int})
+                (hilo-table)
+                (bound-table->design-table))]
+    {:design-table ds
+     :supply-records (design-table->supply-table ds)}))
+
+;;This is the main driver for generating experimental designs and
+;;supply records.
+;;It can be invoked via:
+;;(spit-designs
+;;  "path/to/blah/input.txt"
+;;  "path/to/outputdir")
+
+(defn spit-designs [inpath outroot]
+  (let [{:keys [design-table supply-records]} (raw->designs inpath)
+        design-path (str outroot "\\designs.txt")]
+    (do (println [:saving-designs design-path])
+        (spit design-path
+              (tbl/table->tabdelimited design-table))
+        (println [:saving-supplyrecords (str outroot "\\supplies.txt")])
+        (spit (str outroot "\\supplies.txt")
+              (tbl/table->tabdelimited supply-records)))))
